@@ -131,10 +131,18 @@ class MemoryDecisionTransformer(nn.Module):
         # Memory module (optional)
         if memory_type == 'gru':
             # TODO: Implement GRU memory
+            self.memory = nn.GRU(n_embed, memory_dim, batch_first=True)
+            self.memory_dim = memory_dim
             self.memory_proj = nn.Linear(memory_dim, n_embed)
         elif memory_type == 'lstm':
             # TODO: Implement LSTM memory
+            self.memory = nn.LSTM(n_embed, memory_dim, batch_first=True)
+            self.memory_dim = memory_dim
             self.memory_proj = nn.Linear(memory_dim, n_embed)
+        elif memory_type == 'token':
+            # Learnable memory token of shape [1, 1, D]
+            self.memory_token = nn.Parameter(torch.zeros(1, 1, n_embed))
+            nn.init.xavier_uniform_(self.memory_token)
         else:
             self.memory = None
         
@@ -183,22 +191,28 @@ class MemoryDecisionTransformer(nn.Module):
         
         # add memory
         if self.memory is not None:
-            if self.memory_type == 'gru':
-                if self.hidden_state is None:
-                    # TODO: Implement GRU memory
-                
-                memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-            elif self.memory_type == 'lstm':
-                if self.hidden_state is None:
-                    # TODO: Implement LSTM memory
-                
-                memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-            
-            # project memory to embedding dimension
-            memory_embedding = self.memory_proj(memory_out)
-            
-            # combine memory with state embeddings
-            state_embeddings = state_embeddings + memory_embedding
+            if self.memory_type != 'token':
+		if self.memory_type == 'gru':
+		    if self.hidden_state is None:
+		        # TODO: Implement GRU memory
+		        device = state_embeddings.device
+		        self.hidden_state = torch.zeros(1, batch_size, self.memory_dim)
+		        self.hidden_state = self.hidden_state.to(device)
+		        
+		    memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
+		elif self.memory_type == 'lstm':
+		    if self.hidden_state is None:
+		        # TODO: Implement LSTM memory
+		        device = state_embeddings.device
+		        self.hidden_state = torch.zeros(1, batch_size, self.memory_dim).to(device),torch.zeros(1, batch_size, self.memory_dim).to(device)
+		        
+		    memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
+		    
+		# project memory to embedding dimension
+		memory_embedding = self.memory_proj(memory_out)
+		    
+		# combine memory with state embeddings
+		state_embeddings = state_embeddings + memory_embedding
         
         # prepare sequence for transformer (R_t, o_t, a_t)
         sequence = torch.cat([
@@ -206,6 +220,10 @@ class MemoryDecisionTransformer(nn.Module):
             state_embeddings,
             action_embeddings
         ], dim=1)
+        
+        if self.memory_type == 'token':
+            memory_token = self.memory_token.expand(batch_size, -1, -1)
+            sequence = torch.cat([memory_token, sequence], dim=1)
         
         # add positional encoding
         sequence = self.pos_encoder(sequence)
