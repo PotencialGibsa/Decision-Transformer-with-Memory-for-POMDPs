@@ -141,6 +141,7 @@ class MemoryDecisionTransformer(nn.Module):
             self.memory_proj = nn.Linear(memory_dim, n_embed)
         elif memory_type == 'token':
             # Learnable memory token of shape [1, 1, D]
+            self.memory = None
             self.memory_token = nn.Parameter(torch.zeros(1, 1, n_embed))
             nn.init.xavier_uniform_(self.memory_token)
         else:
@@ -192,27 +193,27 @@ class MemoryDecisionTransformer(nn.Module):
         # add memory
         if self.memory is not None:
             if self.memory_type != 'token':
-		if self.memory_type == 'gru':
-		    if self.hidden_state is None:
-		        # TODO: Implement GRU memory
-		        device = state_embeddings.device
-		        self.hidden_state = torch.zeros(1, batch_size, self.memory_dim)
-		        self.hidden_state = self.hidden_state.to(device)
-		        
-		    memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-		elif self.memory_type == 'lstm':
-		    if self.hidden_state is None:
-		        # TODO: Implement LSTM memory
-		        device = state_embeddings.device
-		        self.hidden_state = torch.zeros(1, batch_size, self.memory_dim).to(device),torch.zeros(1, batch_size, self.memory_dim).to(device)
-		        
-		    memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
-		    
-		# project memory to embedding dimension
-		memory_embedding = self.memory_proj(memory_out)
-		    
-		# combine memory with state embeddings
-		state_embeddings = state_embeddings + memory_embedding
+                if self.memory_type == 'gru':
+                    if self.hidden_state is None:
+                        # TODO: Implement GRU memory
+                        device = state_embeddings.device
+                        self.hidden_state = torch.zeros(1, batch_size, self.memory_dim)
+                        self.hidden_state = self.hidden_state.to(device)
+                        
+                    memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
+                elif self.memory_type == 'lstm':
+                    if self.hidden_state is None:
+                        # TODO: Implement LSTM memory
+                        device = state_embeddings.device
+                        self.hidden_state = torch.zeros(1, batch_size, self.memory_dim).to(device),torch.zeros(1, batch_size, self.memory_dim).to(device)
+                        
+                    memory_out, self.hidden_state = self.memory(state_embeddings, self.hidden_state)
+                    
+                # project memory to embedding dimension
+                memory_embedding = self.memory_proj(memory_out)
+                    
+                # combine memory with state embeddings
+                state_embeddings = state_embeddings + memory_embedding
         
         # prepare sequence for transformer (R_t, o_t, a_t)
         sequence = torch.cat([
@@ -451,6 +452,9 @@ def train_memory_dt(
         returns = []
         successful_episodes = 0
         num_eval_episodes = 10
+
+        all_episode_rtgs = []
+        target_returns = []
         
         for episode in range(num_eval_episodes):
             obs, _ = val_env.reset()
@@ -474,6 +478,9 @@ def train_memory_dt(
             else:
                 target_return = 500.0
             
+            target_returns.append(target_return)
+            episode_rtgs = []
+
             while not done and timestep < max_steps:
                 if isinstance(obs, dict):
                     if 'observation' in obs and 'mask' in obs:
@@ -495,6 +502,7 @@ def train_memory_dt(
                 if len(states) <= 1:
                     # first timestep, use default action
                     action = 0
+                    rtg = target_return
                 else:
                     # use model to predict action
                     context_size = min(len(states), context_length)
@@ -522,6 +530,8 @@ def train_memory_dt(
                         action = val_env.action_space.sample()
                 
                 # take step in environment
+                episode_rtgs.append(rtg)
+
                 next_obs, reward, terminated, truncated, _ = val_env.step(action)
                 done = terminated or truncated
                 
@@ -530,6 +540,8 @@ def train_memory_dt(
                 
                 obs = next_obs
                 timestep += 1
+
+            all_episode_rtgs.append(episode_rtgs)
             
             # check for success
             if isinstance(val_env, VelocityCartPoleEnv) and episode_return >= 450:
@@ -590,6 +602,63 @@ def train_memory_dt(
     plt.tight_layout()
     plt.savefig(f"models/memory_dt_{env_name}_{memory_type}_training.png")
     plt.close()
+
+    ####MY_LOGS
+
+    import json
+    from datetime import datetime
+
+    # Сбор данных для сохранения
+    training_summary = {
+        "timestamp": datetime.now().isoformat(),
+        "env_name": env_name,
+        "dataset_path": dataset_path,
+        "train_size": train_size,
+        "val_size": val_size,
+        "hyperparameters": {
+            "n_epochs": n_epochs,
+            "batch_size": batch_size,
+            "context_length": context_length,
+            "n_embed": n_embed,
+            "n_layer": n_layer,
+            "n_head": n_head,
+            "memory_type": memory_type,
+            "memory_dim": memory_dim,
+            "learning_rate": learning_rate,
+            "weight_decay": weight_decay
+        },
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_returns": val_returns,
+        "best_val_return": best_val_return,
+        "success_rate": float(success_rate),
+        "num_epochs_trained": len(train_losses),
+        'target_returns': target_returns,
+        'episode_rtgs': all_episode_rtgs,
+        "validation_episodes": []
+    }
+
+    # Добавление логов по каждому эпизоду валидации
+    for i, ret in enumerate(returns):
+        training_summary["validation_episodes"].append({
+            "episode": i + 1,
+            "return": ret,
+            "success": int(ret >= -250 if env_name == 'flickering_pendulum'
+                          else (ret >= 450 if env_name == 'velocity_cartpole'
+                                else done and timestep < max_steps)),
+            "steps": timestep
+        })
+
+    # Сохранение в JSON
+    os.makedirs('logs', exist_ok=True)
+    json_path = f"logs/memory_dt_{env_name}_{memory_type}_{train_size}_{n_epochs}_{context_length}_{n_embed}_{memory_dim}_{batch_size}.json"
+    with open(json_path, "w") as f:
+        json.dump(training_summary, f, indent=4)
+
+    print(f"Training summary saved to {json_path}")
+
+
+    ###########
     
     return model, train_losses, val_returns
 
